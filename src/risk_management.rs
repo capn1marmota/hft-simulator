@@ -17,20 +17,29 @@ impl RiskManager {
     }
 
     pub fn validate_order(&self, order: &Order) -> bool {
+        // Check maximum order size
         if order.quantity > self.max_order_size {
             return false;
         }
 
         let symbol = &order.symbol;
-        let new_position = self
-            .current_positions
-            .get(symbol)
-            .map(|pos| *pos + order.quantity)
-            .unwrap_or(order.quantity);
+        let delta = match order.side {
+            OrderSide::Buy => order.quantity,
+            OrderSide::Sell => -order.quantity,
+        };
 
+        // Calculate potential new position
+        let current = self.current_positions
+            .get(symbol)
+            .map(|p| *p)
+            .unwrap_or(0.0);
+        
+        let new_position = current + delta;
+
+        // Check position limits
         if let Some(limit) = self.position_limits.get(symbol) {
-            if new_position > *limit {
-                return false; // Order exceeds position limit
+            if new_position.abs() > *limit {
+                return false;
             }
         }
 
@@ -39,14 +48,15 @@ impl RiskManager {
 
     pub fn update_position(&self, order: &Order) {
         let symbol = order.symbol.clone();
-        let quantity = order.quantity;
+        let delta = match order.side {
+            OrderSide::Buy => order.quantity,
+            OrderSide::Sell => -order.quantity,
+        };
 
-        self.current_positions.alter(&symbol, |_, pos| {
-            match order.side {
-                OrderSide::Buy => pos + quantity,
-                OrderSide::Sell => pos - quantity,
-            }
-        });
+        self.current_positions
+            .entry(symbol)
+            .and_modify(|pos| *pos += delta)
+            .or_insert(delta);
     }
 
     pub fn set_position_limit(&self, symbol: &str, limit: f64) {
@@ -54,6 +64,9 @@ impl RiskManager {
     }
 
     pub fn get_position(&self, symbol: &str) -> f64 {
-        self.current_positions.get(symbol).map(|p| *p).unwrap_or(0.0)
+        self.current_positions
+            .get(symbol)
+            .map(|p| *p)
+            .unwrap_or(0.0)
     }
 }

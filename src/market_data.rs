@@ -9,6 +9,7 @@ struct AlphaVantageResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]  // Temporary until market data integration
 pub struct MinuteData {
     #[serde(rename = "1. open")]
     open: f64,

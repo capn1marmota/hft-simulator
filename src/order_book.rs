@@ -3,18 +3,21 @@ use ordered_float::OrderedFloat;
 use std::collections::BTreeMap;
 use std::cmp::Reverse;
 
+#[allow(dead_code)]  // Market orders planned for phase 2
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderType {
     Market,
     Limit,
 }
 
+#[allow(dead_code)]  // Full order side support needed
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderSide {
     Buy,
     Sell,
 }
 
+#[allow(dead_code)]  // Fields needed for auditing/analytics
 #[derive(Debug, Clone)]
 pub struct Order {
     pub id: u64,
