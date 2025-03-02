@@ -81,4 +81,7 @@ impl OrderBook {
             .first_key_value()
             .map(|(price, _)| price.into_inner())
     }
+    pub fn cancel_order(&self, order_id: u64) {
+    // Implement order cancellation logic
+    }
 }
