@@ -5,6 +5,8 @@ pub struct RiskManager {
     max_order_size: f64,
     position_limits: DashMap<String, f64>,
     current_positions: DashMap<String, f64>,
+    realized_pnl: DashMap<String, f64>,
+    avg_entry_prices: DashMap<String, f64>,
 }
 
 impl RiskManager {
@@ -13,6 +15,8 @@ impl RiskManager {
             max_order_size,
             position_limits: DashMap::new(),
             current_positions: DashMap::new(),
+            realized_pnl: DashMap::new(),
+            avg_entry_prices: DashMap::new(),
         }
     }
 
@@ -46,27 +50,6 @@ impl RiskManager {
         true
     }
 
-    #[allow(dead_code)] // Required for core functionality
-    pub fn update_position(&self, order: &Order, filled_qty: f64) {
-        let symbol = order.symbol.clone();
-        let delta = match order.side {
-            OrderSide::Buy => filled_qty,
-            OrderSide::Sell => -filled_qty,
-        };
-
-        log::debug!("Updating position for order {}", order.id);
-
-        self.current_positions
-            .entry(symbol)
-            .and_modify(|pos|{
-                 *pos += delta;
-                 log::info!("Position updated: {} {:.2}", order.symbol, *pos);
-            })
-            .or_insert(delta);
-
-        log::debug!("Updated {} position by {:.2}", order.symbol, delta);
-    }
-
     pub fn set_position_limit(&self, symbol: &str, limit: f64) {
         self.position_limits.insert(symbol.to_string(), limit);
     }
@@ -76,5 +59,78 @@ impl RiskManager {
             .get(symbol)
             .map(|p| *p)
             .unwrap_or(0.0)
+    }
+    #[allow(dead_code)]
+    pub fn get_realized_pnl(&self, symbol: &str) -> f64 {
+        self.realized_pnl
+            .get(symbol)
+            .map(|p| *p)
+            .unwrap_or(0.0)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_avg_price(&self, symbol: &str) -> f64 {
+        self.avg_entry_prices
+            .get(symbol)
+            .map(|p| *p)
+            .unwrap_or(0.0)
+    }
+
+    pub fn record_transaction(&self, symbol: &str, price: f64, quantity: f64, side: OrderSide) {
+        if quantity <= 0.0 {
+            return;
+        }
+
+        let signed_quantity = match side {
+            OrderSide::Buy => quantity,
+            OrderSide::Sell => -quantity,
+        };
+
+        // Update position
+        let mut position_entry = self.current_positions.entry(symbol.to_string()).or_insert(0.0);
+        let old_position = *position_entry;
+        *position_entry += signed_quantity;
+        let new_position = *position_entry;
+
+        // Update average price and PnL
+        let mut avg_price_entry = self.avg_entry_prices.entry(symbol.to_string()).or_insert(0.0);
+        let mut realized_entry = self.realized_pnl.entry(symbol.to_string()).or_insert(0.0);
+
+        let old_avg_price = *avg_price_entry;
+        let mut new_avg_price = old_avg_price;
+        let mut realized_pnl = 0.0;
+
+        // Handle position changes
+        if old_position == 0.0 {
+            // New position
+            new_avg_price = price;
+        } else if old_position.signum() != new_position.signum() {
+            // Position flipped (long <-> short)
+            realized_pnl = (price - old_avg_price) * old_position.abs();
+            new_avg_price = price;
+        } else if old_position.abs() < new_position.abs() {
+            // Adding to position
+            let total_cost = (old_position.abs() * old_avg_price) + (quantity * price);
+            new_avg_price = total_cost / new_position.abs();
+        }
+
+        // Update stored values
+        *avg_price_entry = new_avg_price;
+        *realized_entry += realized_pnl;
+
+        log::info!(
+            "Transaction: {} {} x {} @ {:.4} (Pos: {:.2} -> {:.2}, Avg: {:.2}, PnL: {:.2})",
+            match side {
+                OrderSide::Buy => "Buy",
+                OrderSide::Sell => "Sell",
+            },
+            quantity,
+            symbol,
+            price,
+            old_position,
+            new_position,
+            new_avg_price,
+            realized_pnl
+        );
     }
 }
