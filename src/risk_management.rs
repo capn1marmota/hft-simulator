@@ -46,17 +46,25 @@ impl RiskManager {
         true
     }
 
-    pub fn update_position(&self, order: &Order) {
+    #[allow(dead_code)] // Required for core functionality
+    pub fn update_position(&self, order: &Order, filled_qty: f64) {
         let symbol = order.symbol.clone();
         let delta = match order.side {
-            OrderSide::Buy => order.quantity,
-            OrderSide::Sell => -order.quantity,
+            OrderSide::Buy => filled_qty,
+            OrderSide::Sell => -filled_qty,
         };
+
+        log::debug!("Updating position for order {}", order.id);
 
         self.current_positions
             .entry(symbol)
-            .and_modify(|pos| *pos += delta)
+            .and_modify(|pos|{
+                 *pos += delta;
+                 log::info!("Position updated: {} {:.2}", order.symbol, *pos);
+            })
             .or_insert(delta);
+
+        log::debug!("Updated {} position by {:.2}", order.symbol, delta);
     }
 
     pub fn set_position_limit(&self, symbol: &str, limit: f64) {

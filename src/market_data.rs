@@ -12,6 +12,7 @@ struct AlphaVantageResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] //Temporary for API compatibility
 pub struct MinuteData {
     #[serde(rename = "1. open")]
     pub open: f64,

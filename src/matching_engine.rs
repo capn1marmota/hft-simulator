@@ -3,6 +3,7 @@ use crate::order_book::{Order, OrderBook, OrderType, OrderSide};
 use std::sync::Arc;
 use log::warn;
 use ordered_float::OrderedFloat;
+use crate::RiskManager;
 
 pub enum EngineMessage {
     NewOrder(Order),
@@ -11,13 +12,15 @@ pub enum EngineMessage {
 
 pub struct MatchingEngine {
     order_book: Arc<OrderBook>,
+    risk_manager: Arc<RiskManager>,
     message_rx: mpsc::UnboundedReceiver<EngineMessage>,
 }
 
 impl MatchingEngine {
-    pub fn new(order_book: Arc<OrderBook>) -> (Self, mpsc::UnboundedSender<EngineMessage>) {
+    pub fn new(order_book: Arc<OrderBook>,
+    risk_manager: Arc<RiskManager>) -> (Self, mpsc::UnboundedSender<EngineMessage>) {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
-        (Self { order_book, message_rx }, message_tx)
+        (Self { order_book, message_rx, risk_manager, }, message_tx)
     }
 
     pub async fn run(mut self) {
@@ -42,9 +45,12 @@ impl MatchingEngine {
         }
     }
 
-    async fn process_order(&self, order: Order) {
+    async fn process_order(&self, mut order: Order) {
         let symbol = order.symbol.clone();
         let remaining_qty = order.quantity;
+
+        // Log order receipt
+        log::debug!("Processing order {}: {:?}", order.id, order);
     
         match order.order_type {
             OrderType::Limit => {
@@ -53,7 +59,7 @@ impl MatchingEngine {
                         OrderSide::Buy => true,
                         OrderSide::Sell => false,
                     };
-                    self.process_limit_order(&symbol, order, remaining_qty, is_bid).await
+                    self.process_limit_order(&symbol, &order, remaining_qty, is_bid).await
                 } else {
                     warn!("Limit order with invalid price: {}", order.price);
                 }
@@ -63,15 +69,23 @@ impl MatchingEngine {
                     OrderSide::Buy => true,
                     OrderSide::Sell => false,
                 };
-                self.process_market_order(&symbol, order, remaining_qty, is_bid).await
+                self.process_market_order(&symbol, &order, remaining_qty, is_bid).await
             }
+        }
+
+        if remaining_qty > 0.0 {
+            let fill_qty = order.quantity - remaining_qty; // Calculate how much was filled
+            self.risk_manager.update_position(&order, fill_qty);
+            log::debug!("Adding remaining {} to book", remaining_qty);
+            order.quantity = remaining_qty; // Modify original order
+            self.order_book.add_order(order);  // Pass ownership
         }
     }
 
     async fn process_limit_order(
         &self,
         symbol: &str,
-        order: Order,
+        order: &Order,
         mut remaining_qty: f64,
         is_bid: bool,
     ) {
@@ -202,7 +216,9 @@ impl MatchingEngine {
     
         // Add remaining order to the book if not fully matched
         if remaining_qty > 0.0 {
-            let mut new_order = order;
+            let fill_qty = order.quantity - remaining_qty; // Calculate how much was filled
+            self.risk_manager.update_position(&order, fill_qty);
+            let mut new_order = order.clone();
             new_order.quantity = remaining_qty;
             self.order_book.add_order(new_order);
         }
@@ -211,7 +227,7 @@ impl MatchingEngine {
     async fn process_market_order(
         &self,
         symbol: &str,
-        order: Order,
+        order: &Order,
         mut remaining_qty: f64,
         is_bid: bool,
     ) {
@@ -326,6 +342,8 @@ impl MatchingEngine {
         // For market orders, we don't add the remaining quantity to the book
         // Instead, we can either reject the unfilled portion or report it
         if remaining_qty > 0.0 {
+            let fill_qty = order.quantity - remaining_qty; // Calculate how much was filled
+            self.risk_manager.update_position(&order, fill_qty);
             println!("Market order partially filled: {} remaining out of {}", 
                      remaining_qty, order.quantity);
         }

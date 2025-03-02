@@ -36,6 +36,7 @@ pub struct OrderBook {
     pub asks: DashMap<String, BTreeMap<OrderedFloat<f64>, Vec<Order>>>,          // Asks: lowest price first
 }
 
+
 impl OrderBook {
     pub fn new() -> Self {
         OrderBook {
@@ -69,7 +70,7 @@ impl OrderBook {
                     .push(order);
             }
         }
-}
+    }
 
     pub fn get_best_bid(&self, symbol: &str) -> Option<f64> {
         self.bids.get(symbol)?
@@ -84,37 +85,39 @@ impl OrderBook {
     }
 
     pub fn update_from_market_data(&self, symbol: &str, data: &MinuteData) {
+        #[allow(dead_code)] // Temporary until full integration
         let orders = data.to_orders(symbol);
         for order in orders {
             self.add_order(order);
         }
     }
 
+    #[allow(unused_variables)] // For len_before
     pub fn cancel_order(&self, symbol: &str, order_id: u64) -> bool {
         let mut cancelled = false;
         
         // Check bids
-        if let Some(mut bids) = self.bids.get_mut(symbol) {
+        self.bids.get_mut(symbol).map(|mut bids| {
             bids.retain(|_, orders| {
-                let len_before = orders.len();
+                let original_len = orders.len();
                 orders.retain(|o| o.id != order_id);
-                cancelled |= orders.len() < len_before;
+                cancelled |= orders.len() < original_len;
                 !orders.is_empty()
             });
-        }
+        });
         
         // Check asks if not found in bids
         if !cancelled {
-            if let Some(mut asks) = self.asks.get_mut(symbol) {
+            self.asks.get_mut(symbol).map(|mut asks| {
                 asks.retain(|_, orders| {
-                    let len_before = orders.len();
+                    let original_len = orders.len();
                     orders.retain(|o| o.id != order_id);
-                    cancelled |= orders.len() < len_before;
+                    cancelled |= orders.len() < original_len;
                     !orders.is_empty()
                 });
-            }
+            });
         }
-        
+
         cancelled
     }
 }

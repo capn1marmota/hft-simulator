@@ -3,17 +3,17 @@ mod order_book;
 mod matching_engine;
 mod risk_management;
 
-use crate::market_data::fetch_market_data;
-
 use std::sync::Arc;
 use std::time::Duration;
+use uuid::Uuid;
+use tokio::signal;
+use rand::Rng;
+use crate::market_data::fetch_market_data;
 use crate::{
     order_book::{Order, OrderBook, OrderType, OrderSide},
     matching_engine::{MatchingEngine, EngineMessage},
     risk_management::RiskManager,
 };
-use tokio::signal;
-use rand::Rng;
 
 #[tokio::main]
 async fn main() {
@@ -23,12 +23,18 @@ async fn main() {
     
     // Initialize core components
     let order_book = Arc::new(OrderBook::new());
-    let (matching_engine, engine_tx) = MatchingEngine::new(order_book.clone());
+    
+    // Create the risk manager first
     let risk_manager = Arc::new({
         let rm = RiskManager::new(1_000_000.0);
         rm.set_position_limit("AAPL", 10_000.0);
         rm
     });
+    
+    // Then create the matching engine with the risk_manager
+    let (matching_engine, engine_tx) = MatchingEngine::new(
+        order_book.clone(), 
+        risk_manager.clone());
 
     // Start market data stream
     tokio::spawn({
@@ -51,6 +57,7 @@ async fn main() {
         }
     });
 
+    // Rest of your code remains the same...
     // Start position monitoring
     tokio::spawn({
         let risk_manager = risk_manager.clone();
@@ -80,6 +87,23 @@ async fn main() {
             }
         }
     });
+    
+    // Market data usage
+    tokio::spawn({
+    let order_book = order_book.clone();
+    async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Ok(data) = fetch_market_data("AAPL").await {
+                log::info!("Processing {} market data entries", data.len());
+                for (_ts, md) in data {
+                    order_book.update_from_market_data("AAPL", &md);
+                }
+            }
+        }
+    }
+    });
 
     // Start matching engine
     tokio::spawn(async move {
@@ -94,12 +118,11 @@ async fn main() {
 
     // Order generation loop
     let order_loop = async {
-        let order_id = 1; // Removed 'mut' as it's not modified in this example
         let mut rng = rand::thread_rng();
         
         loop {
             let order = Order {
-                id: order_id,
+                id: Uuid::new_v4().as_u128() as u64, // Nanosecond precision
                 symbol: "AAPL".to_string(),
                 price: 150.0 + rng.gen::<f64>() * 5.0,
                 quantity: 100.0,
