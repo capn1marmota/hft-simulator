@@ -1,6 +1,9 @@
 use serde::Deserialize;
 use reqwest::Error;
 use chrono::{DateTime, Utc};
+use crate::{
+    order_book::{Order, OrderType, OrderSide},
+};
 
 #[derive(Debug, Deserialize)]
 struct AlphaVantageResponse {
@@ -9,16 +12,15 @@ struct AlphaVantageResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]  // Temporary until market data integration
 pub struct MinuteData {
     #[serde(rename = "1. open")]
-    open: f64,
+    pub open: f64,
     #[serde(rename = "2. high")]
-    high: f64,
+    pub high: f64,
     #[serde(rename = "4. close")]
-    close: f64,
+    pub close: f64,
     #[serde(rename = "5. volume")]
-    volume: f64,
+    pub volume: f64,
 }
 
 pub async fn fetch_market_data(symbol: &str) -> Result<Vec<(DateTime<Utc>, MinuteData)>, Error> {
@@ -39,4 +41,30 @@ pub async fn fetch_market_data(symbol: &str) -> Result<Vec<(DateTime<Utc>, Minut
     }
 
     Ok(data)
+}
+impl MinuteData {
+    pub fn to_orders(&self, symbol: &str) -> Vec<Order> {
+        let spread = 0.1;
+        let ts = Utc::now().timestamp();
+        vec![
+            Order {
+                id: (ts * 1000) as u64,
+                symbol: symbol.to_string(),
+                price: self.close - spread,
+                quantity: 100.0,
+                order_type: OrderType::Limit,
+                side: OrderSide::Buy,
+                timestamp: ts,
+            },
+            Order {
+                id: (ts * 1000 + 1) as u64,
+                symbol: symbol.to_string(),
+                price: self.close + spread,
+                quantity: 100.0,
+                order_type: OrderType::Limit,
+                side: OrderSide::Sell,
+                timestamp: ts,
+            }
+        ]
+    }
 }

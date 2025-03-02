@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use ordered_float::OrderedFloat;
 use std::collections::BTreeMap;
 use std::cmp::Reverse;
+use crate::market_data::MinuteData;
 
 #[allow(dead_code)]  // Market orders planned for phase 2
 #[derive(Debug, Clone, PartialEq)]
@@ -81,7 +82,39 @@ impl OrderBook {
             .first_key_value()
             .map(|(price, _)| price.into_inner())
     }
-    pub fn cancel_order(&self, order_id: u64) {
-    // Implement order cancellation logic
+
+    pub fn update_from_market_data(&self, symbol: &str, data: &MinuteData) {
+        let orders = data.to_orders(symbol);
+        for order in orders {
+            self.add_order(order);
+        }
+    }
+
+    pub fn cancel_order(&self, symbol: &str, order_id: u64) -> bool {
+        let mut cancelled = false;
+        
+        // Check bids
+        if let Some(mut bids) = self.bids.get_mut(symbol) {
+            bids.retain(|_, orders| {
+                let len_before = orders.len();
+                orders.retain(|o| o.id != order_id);
+                cancelled |= orders.len() < len_before;
+                !orders.is_empty()
+            });
+        }
+        
+        // Check asks if not found in bids
+        if !cancelled {
+            if let Some(mut asks) = self.asks.get_mut(symbol) {
+                asks.retain(|_, orders| {
+                    let len_before = orders.len();
+                    orders.retain(|o| o.id != order_id);
+                    cancelled |= orders.len() < len_before;
+                    !orders.is_empty()
+                });
+            }
+        }
+        
+        cancelled
     }
 }

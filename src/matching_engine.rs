@@ -4,26 +4,41 @@ use std::sync::Arc;
 use log::warn;
 use ordered_float::OrderedFloat;
 
+pub enum EngineMessage {
+    NewOrder(Order),
+    CancelOrder { symbol: String, order_id: u64 },
+}
+
 pub struct MatchingEngine {
     order_book: Arc<OrderBook>,
-    order_rx: mpsc::UnboundedReceiver<Order>,
+    message_rx: mpsc::UnboundedReceiver<EngineMessage>,
 }
 
 impl MatchingEngine {
-    pub fn new(order_book: Arc<OrderBook>) -> (Self, mpsc::UnboundedSender<Order>) {
-        let (order_tx, order_rx) = mpsc::unbounded_channel();
-        
-        let engine = Self {
-            order_book,
-            order_rx,
-        };
-        
-        (engine, order_tx)
+    pub fn new(order_book: Arc<OrderBook>) -> (Self, mpsc::UnboundedSender<EngineMessage>) {
+        let (message_tx, message_rx) = mpsc::unbounded_channel();
+        (Self { order_book, message_rx }, message_tx)
     }
-    
+
     pub async fn run(mut self) {
-        while let Some(order) = self.order_rx.recv().await {
-            self.process_order(order).await;
+        while let Some(msg) = self.message_rx.recv().await {
+            match msg {
+                EngineMessage::NewOrder(order) => {
+                    self.process_order(order).await;
+                }
+                EngineMessage::CancelOrder { symbol, order_id } => {
+                    self.process_cancellation(&symbol, order_id).await;
+                }
+            }
+        }
+    }
+
+    async fn process_cancellation(&self, symbol: &str, order_id: u64) {
+        let cancelled = self.order_book.cancel_order(symbol, order_id);
+        if cancelled {
+            log::info!("Cancelled order {}", order_id);
+        } else {
+            log::warn!("Failed to cancel order {}", order_id);
         }
     }
 
