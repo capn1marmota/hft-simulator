@@ -111,7 +111,7 @@ impl MatchingEngine {
         )
     }
 
-    pub async fn run(self, mut message_rx: mpsc::UnboundedReceiver<EngineMessage>) {
+    pub async fn run(&self, message_rx: &mut mpsc::UnboundedReceiver<EngineMessage>) {
         while let Some(msg) = message_rx.recv().await {
             match msg {
                 EngineMessage::NewOrder(order) => {

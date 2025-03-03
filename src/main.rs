@@ -4,6 +4,7 @@ mod order_book;
 mod risk_management;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
+use tokio::sync::Mutex;
 
 use crate::market_data::fetch_market_data;
 use crate::{
@@ -12,6 +13,7 @@ use crate::{
     risk_management::RiskManager,
 };
 use rand::Rng;
+use reqwest::Client;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
@@ -23,7 +25,10 @@ async fn main() {
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    // Initialize core components
+    // Initialize shared HTTP client
+    let http_client = Arc::new(Client::new());
+
+    // Initialize order book
     let order_book = Arc::new(OrderBook::new());
 
     // Create the risk manager first
@@ -33,47 +38,50 @@ async fn main() {
         rm
     });
 
-    // Then create the matching engine
+    // Create the matching engine
     let (matching_engine, engine_tx, message_rx) =
         MatchingEngine::new(order_book.clone(), risk_manager.clone());
     let matching_engine = Arc::new(matching_engine);
 
-    // Start market data stream
+    // Market data stream (now using `reqwest::Client`)
     tokio::spawn({
         let engine_tx_clone = engine_tx.clone();
-        let _order_book = order_book.clone(); // Suppress unused variable warning
+        let http_client = http_client.clone();
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                if let Ok(data) = fetch_market_data("AAPL").await {
-                    log::info!("Received {} market data points", data.len());
-                    for (_, md) in data.iter() {
-                        let orders = md.to_orders("AAPL", Decimal::new(1, 2));
-                        for order in orders {
-                            engine_tx_clone
-                                .send(EngineMessage::NewOrder(order))
-                                .unwrap();
+                match fetch_market_data(&http_client, "AAPL").await {
+                    Ok(data) => {
+                        log::info!("Received {} market data points", data.len());
+                        for (_, md) in data.iter() {
+                            let orders = md.to_orders("AAPL", Decimal::new(1, 2));
+                            for order in orders {
+                                if let Err(e) = engine_tx_clone.send(EngineMessage::NewOrder(order))
+                                {
+                                    log::error!("Failed to send order: {:?}", e);
+                                }
+                            }
                         }
                     }
+                    Err(e) => log::error!("Market data fetch failed: {:?}", e),
                 }
             }
         }
     });
 
-    // Start comprehensive reporting (matching engine positions)
+    // Matching engine position reporting
+    let message_rx = Arc::new(Mutex::new(message_rx));
     tokio::spawn({
-        let engine = matching_engine.clone();
+        let engine = Arc::clone(&matching_engine);
+        let message_rx = Arc::clone(&message_rx);
         async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                interval.tick().await;
-                engine.report_positions();
-            }
+            let mut lock = message_rx.lock().await;
+            engine.run(&mut *lock).await;
         }
     });
 
-    // Start spread monitor (order book best bid/ask)
+    // Spread monitoring (best bid/ask)
     tokio::spawn({
         let order_book = order_book.clone();
         async move {
@@ -90,46 +98,39 @@ async fn main() {
         }
     });
 
-    // Update market data in order book
+    // Market data updates in order book (now concurrent)
     tokio::spawn({
         let order_book = order_book.clone();
+        let http_client = http_client.clone();
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                if let Ok(data) = fetch_market_data("AAPL").await {
-                    log::info!("Processing {} market data entries", data.len());
-                    for (_ts, md) in data {
-                        order_book.update_from_market_data("AAPL", &md, Decimal::new(1, 2));
+                match fetch_market_data(&http_client, "AAPL").await {
+                    Ok(data) => {
+                        log::info!("Processing {} market data entries", data.len());
+                        for (_ts, md) in data {
+                            order_book.update_from_market_data("AAPL", &md, Decimal::new(1, 2));
+                        }
                     }
+                    Err(e) => log::error!("Market data update failed: {:?}", e),
                 }
             }
         }
     });
 
-    // Start the matching engine processing loop
-    {
-        let engine_clone = matching_engine.clone();
-        tokio::spawn(async move {
-            // Cloning the engine here to satisfy ownership; adjust as needed.
-            let engine = engine_clone.as_ref().clone();
-            engine.run(message_rx).await;
-        });
-    }
-
-    // Start risk manager reporting positions (using mid price from order book)
-    {
-        let risk_manager_clone = risk_manager.clone();
-        let order_book_clone = order_book.clone();
-        tokio::spawn(async move {
+    // Risk manager reporting
+    tokio::spawn({
+        let risk_manager = risk_manager.clone();
+        let order_book = order_book.clone();
+        async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                risk_manager_clone
-                    .report_positions(|symbol| order_book_clone.get_mid_price(symbol));
+                risk_manager.report_positions(|symbol| order_book.get_mid_price(symbol));
             }
-        });
-    }
+        }
+    });
 
     // Shutdown listener
     let shutdown = async {
@@ -137,17 +138,16 @@ async fn main() {
         log::info!("Shutting down HFT simulator");
     };
 
-    // Order generation loop
+    // Order generation loop with randomized orders
     let order_loop = async {
         let mut rng = rand::thread_rng();
-
         loop {
             let price = Decimal::from_f64(150.0 + rng.gen::<f64>() * 5.0).unwrap_or(Decimal::ZERO);
             let quantity = Decimal::from(100);
 
             let order = Order {
                 id: Uuid::new_v4().as_u128() as u64,
-                symbol: "AAPL".to_string(),
+                symbol: "AAPL".into(),
                 price,
                 quantity,
                 order_type: OrderType::Limit,
@@ -160,9 +160,9 @@ async fn main() {
             };
 
             if risk_manager.validate_order(&order) {
-                engine_tx
-                    .send(EngineMessage::NewOrder(order.clone()))
-                    .unwrap();
+                if let Err(e) = engine_tx.send(EngineMessage::NewOrder(order.clone())) {
+                    log::error!("Failed to send order: {:?}", e);
+                }
 
                 // 25% chance to cancel after 1 second
                 if rand::random::<f64>() < 0.25 {
@@ -171,8 +171,9 @@ async fn main() {
                     let order_id = order.id;
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_secs(1)).await;
-                        tx.send(EngineMessage::CancelOrder { symbol, order_id })
-                            .unwrap();
+                        if let Err(e) = tx.send(EngineMessage::CancelOrder { symbol, order_id }) {
+                            log::error!("Failed to cancel order: {:?}", e);
+                        }
                     });
                 }
             }
@@ -181,7 +182,7 @@ async fn main() {
         }
     };
 
-    // Run order generation loop alongside shutdown signal listener
+    // Run order loop alongside shutdown listener
     tokio::select! {
         _ = order_loop => {},
         _ = shutdown => {},
