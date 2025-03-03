@@ -21,7 +21,7 @@ A high-frequency trading simulator written in Rust that models a complete tradin
 
 1. Clone the repository:
    ```
-   git clone https://github.com/yourusername/hft-simulator.git
+   git clone https://github.com/capn1marmota/hft-simulator.git
    cd hft-simulator
    ```
 
