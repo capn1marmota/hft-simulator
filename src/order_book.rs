@@ -73,15 +73,23 @@ impl OrderBook {
     }
 
     pub fn get_best_bid(&self, symbol: &str) -> Option<f64> {
-        self.bids.get(symbol)?
-            .first_key_value()
-            .map(|(price, _)| price.0.into_inner())
+        self.bids.get(symbol)
+            .and_then(|bids_ref| {
+                bids_ref.last_key_value().map(|(price, _)| price.0.into_inner())
+            })
     }
     
     pub fn get_best_ask(&self, symbol: &str) -> Option<f64> {
-        self.asks.get(symbol)?
-            .first_key_value()
-            .map(|(price, _)| price.into_inner())
+        self.asks.get(symbol)
+            .and_then(|asks_ref| {
+                asks_ref.first_key_value().map(|(price, _)| price.into_inner())
+            })
+    }
+
+    pub fn get_mid_price(&self, symbol: &str) -> Option<f64> {
+        self.get_best_bid(symbol)
+            .zip(self.get_best_ask(symbol))
+            .map(|(bid, ask)| (bid + ask) / 2.0)
     }
 
     pub fn update_from_market_data(&self, symbol: &str, data: &MinuteData) {

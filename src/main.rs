@@ -31,15 +31,17 @@ async fn main() {
         rm
     });
     
-    // Then create the matching engine with the risk_manager
-    let (matching_engine, engine_tx) = MatchingEngine::new(
+    // Then create the matching engine
+    let (matching_engine, engine_tx, message_rx) = MatchingEngine::new(
         order_book.clone(), 
-        risk_manager.clone());
+        risk_manager.clone()
+    );
+    let matching_engine = Arc::new(matching_engine);
 
     // Start market data stream
     tokio::spawn({
         let engine_tx_clone = engine_tx.clone();
-        let _order_book = order_book.clone(); // Prefix with underscore to avoid warning
+        let _order_book = order_book.clone(); // Suppress unused variable warning
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
@@ -57,21 +59,19 @@ async fn main() {
         }
     });
 
-    // Rest of your code remains the same...
-    // Start position monitoring
+    // Start comprehensive reporting (matching engine positions)
     tokio::spawn({
-        let risk_manager = risk_manager.clone();
+        let engine = matching_engine.clone();
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                let position = risk_manager.get_position("AAPL");
-                log::info!("Current AAPL position: {:.2}", position);
+                engine.report_positions();
             }
         }
     });
 
-    // Start spread monitor
+    // Start spread monitor (order book best bid/ask)
     tokio::spawn({
         let order_book = order_book.clone();
         async move {
@@ -88,29 +88,49 @@ async fn main() {
         }
     });
     
-    // Market data usage
+    // Update market data in order book
     tokio::spawn({
-    let order_book = order_book.clone();
-    async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            if let Ok(data) = fetch_market_data("AAPL").await {
-                log::info!("Processing {} market data entries", data.len());
-                for (_ts, md) in data {
-                    order_book.update_from_market_data("AAPL", &md);
+        let order_book = order_book.clone();
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Ok(data) = fetch_market_data("AAPL").await {
+                    log::info!("Processing {} market data entries", data.len());
+                    for (_ts, md) in data {
+                        order_book.update_from_market_data("AAPL", &md);
+                    }
                 }
             }
         }
+    });
+
+    // Start the matching engine processing loop
+    {
+        let engine_clone = matching_engine.clone();
+        tokio::spawn(async move {
+            // Cloning the engine here to satisfy ownership; adjust as needed.
+            let engine = engine_clone.as_ref().clone();
+            engine.run(message_rx).await;
+        });
     }
-    });
 
-    // Start matching engine
-    tokio::spawn(async move {
-        matching_engine.run().await;
-    });
+    // Start risk manager reporting positions (using mid price from order book)
+    {
+        let risk_manager_clone = risk_manager.clone();
+        let order_book_clone = order_book.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                risk_manager_clone.report_positions(|symbol| {
+                    order_book_clone.get_mid_price(symbol)
+                });
+            }
+        });
+    }
 
-    // Start shutdown listener
+    // Shutdown listener
     let shutdown = async {
         signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
         log::info!("Shutting down HFT simulator");
@@ -122,7 +142,7 @@ async fn main() {
         
         loop {
             let order = Order {
-                id: Uuid::new_v4().as_u128() as u64, // Nanosecond precision
+                id: Uuid::new_v4().as_u128() as u64,
                 symbol: "AAPL".to_string(),
                 price: 150.0 + rng.gen::<f64>() * 5.0,
                 quantity: 100.0,
@@ -150,6 +170,7 @@ async fn main() {
         }
     };
 
+    // Run order generation loop alongside shutdown signal listener
     tokio::select! {
         _ = order_loop => {},
         _ = shutdown => {},

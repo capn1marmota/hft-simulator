@@ -9,29 +9,37 @@ pub enum EngineMessage {
     CancelOrder { symbol: String, order_id: u64 },
 }
 
+#[derive(Clone)]
 pub struct MatchingEngine {
     order_book: Arc<OrderBook>,
     risk_manager: Arc<RiskManager>,
-    message_rx: mpsc::UnboundedReceiver<EngineMessage>,
 }
 
 impl MatchingEngine {
+    pub fn report_positions(&self) {
+        let get_price = |symbol: &str| {
+            self.order_book.get_best_bid(symbol)
+                .zip(self.order_book.get_best_ask(symbol))
+                .map(|(bid, ask)| (bid + ask) / 2.0)
+        };
+
+        self.risk_manager.report_positions(get_price);
+    }
+
     pub fn new(
         order_book: Arc<OrderBook>,
         risk_manager: Arc<RiskManager>
-    ) -> (Self, mpsc::UnboundedSender<EngineMessage>) {
+    ) -> (Self, mpsc::UnboundedSender<EngineMessage>, mpsc::UnboundedReceiver<EngineMessage>) {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
-        (Self { order_book, message_rx, risk_manager }, message_tx)
+        (Self { order_book, risk_manager }, message_tx, message_rx)
     }
 
-    pub async fn run(mut self) {
-        while let Some(msg) = self.message_rx.recv().await {
+    pub async fn run(self, mut message_rx: mpsc::UnboundedReceiver<EngineMessage>) {
+        while let Some(msg) = message_rx.recv().await {
             match msg {
-                EngineMessage::NewOrder(order) => {
-                    self.process_order(order).await;
-                }
+                EngineMessage::NewOrder(order) => self.process_order(order).await,
                 EngineMessage::CancelOrder { symbol, order_id } => {
-                    self.process_cancellation(&symbol, order_id).await;
+                    self.process_cancellation(&symbol, order_id).await
                 }
             }
         }
@@ -48,7 +56,7 @@ impl MatchingEngine {
     async fn process_order(&self, order: Order) {
         let symbol = order.symbol.clone();
         let remaining_qty = order.quantity;
-        let mut order = order.clone();
+        let order = order.clone();
 
         info!("Processing order {}: {:?}", order.id, order);
     
@@ -274,4 +282,17 @@ impl MatchingEngine {
             self.risk_manager.record_transaction(symbol, price, quantity, side);
         }
     }
+
+    #[allow(dead_code)]  // Used for scheduled reporting
+    pub async fn start_reporting(self: Arc<Self>, interval_secs: u64) {
+        let engine = Arc::new(self.clone());
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+            loop {
+                interval.tick().await;
+                engine.report_positions();
+            }
+        });
+    }
+
 }

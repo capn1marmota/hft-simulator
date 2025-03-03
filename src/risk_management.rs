@@ -54,6 +54,7 @@ impl RiskManager {
         self.position_limits.insert(symbol.to_string(), limit);
     }
 
+    #[allow(dead_code)]  // Used for debugging/reporting
     pub fn get_position(&self, symbol: &str) -> f64 {
         self.current_positions
             .get(symbol)
@@ -92,31 +93,34 @@ impl RiskManager {
         *position_entry += signed_quantity;
         let new_position = *position_entry;
 
-        // Update average price and PnL
+        // Update average price and realized PnL
         let mut avg_price_entry = self.avg_entry_prices.entry(symbol.to_string()).or_insert(0.0);
         let mut realized_entry = self.realized_pnl.entry(symbol.to_string()).or_insert(0.0);
 
         let old_avg_price = *avg_price_entry;
-        let mut new_avg_price = old_avg_price;
-        let mut realized_pnl = 0.0;
 
-        // Handle position changes
-        if old_position == 0.0 {
-            // New position
-            new_avg_price = price;
-        } else if old_position.signum() != new_position.signum() {
-            // Position flipped (long <-> short)
-            realized_pnl = (price - old_avg_price) * old_position.abs();
-            new_avg_price = price;
-        } else if old_position.abs() < new_position.abs() {
-            // Adding to position
-            let total_cost = (old_position.abs() * old_avg_price) + (quantity * price);
-            new_avg_price = total_cost / new_position.abs();
+        if old_position != 0.0 && new_position.signum() != old_position.signum() {
+            // Position reversal: fully close old position and start a new one.
+            let pnl = (price - old_avg_price) * old_position.abs();
+            *realized_entry += pnl;
+            *avg_price_entry = price; // Reset average price to current price for the new position
+        } else if new_position.abs() < old_position.abs() {
+            // Partial closure: only part of the position is closed; average price remains unchanged.
+            let closed_quantity = (old_position.abs() - new_position.abs()).min(quantity);
+            let pnl = match side {
+                OrderSide::Sell => (price - old_avg_price) * closed_quantity,
+                OrderSide::Buy => (old_avg_price - price) * closed_quantity,
+            };
+            *realized_entry += pnl;
+            // Leave avg_price_entry unchanged for the remaining position.
+        } else if new_position != 0.0 {
+            // Position increase (or a consistent position): update weighted average price.
+            let total_quantity = old_position.abs() + quantity;
+            *avg_price_entry = ((old_avg_price * old_position.abs()) + (price * quantity)) / total_quantity;
+        } else {
+            // Position fully closed: reset average price.
+            *avg_price_entry = 0.0;
         }
-
-        // Update stored values
-        *avg_price_entry = new_avg_price;
-        *realized_entry += realized_pnl;
 
         log::info!(
             "Transaction: {} {} x {} @ {:.4} (Pos: {:.2} -> {:.2}, Avg: {:.2}, PnL: {:.2})",
@@ -129,8 +133,31 @@ impl RiskManager {
             price,
             old_position,
             new_position,
-            new_avg_price,
-            realized_pnl
+            *avg_price_entry,
+            *realized_entry
         );
+    }
+
+    #[allow(dead_code)]
+    pub fn report_positions(&self, get_price: impl Fn(&str) -> Option<f64>) {
+        for entry in self.current_positions.iter() {
+            let symbol = entry.key();
+            let position = entry.value();
+            let realized = self.realized_pnl.get(symbol).map(|v| *v).unwrap_or(0.0);
+            let avg_price = self.avg_entry_prices.get(symbol).map(|v| *v).unwrap_or(0.0);
+            
+            let unrealized = get_price(symbol)
+                .map(|mp| match position.signum() {
+                    1.0 => (mp - avg_price) * position,
+                    -1.0 => (avg_price - mp) * position.abs(),
+                    _ => 0.0
+                })
+                .unwrap_or(0.0);
+
+            log::info!(
+                "Position Report | {} | Size: {:.2} | Avg: {:.2} | Realized: {:.2} | Unrealized: {:.2}",
+                symbol, position, avg_price, realized, unrealized
+            );
+        }
     }
 }
