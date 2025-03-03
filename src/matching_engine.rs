@@ -1,32 +1,93 @@
 use crate::order_book::{Order, OrderBook, OrderSide, OrderType};
-use crate::RiskManager;
+use crate::risk_management::RiskManager;
 use log::{info, warn};
 use ordered_float::OrderedFloat;
 use std::cmp::Reverse;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
+
+#[derive(Debug, Clone)]
+pub struct Trade {
+    pub id: u64,
+    pub symbol: String,
+    pub price: f64,
+    pub quantity: f64,
+    pub buyer_id: u64,
+    pub seller_id: u64,
+    pub timestamp: i64,
+}
 
 pub enum EngineMessage {
     NewOrder(Order),
     CancelOrder { symbol: String, order_id: u64 },
+    BatchOrders(Vec<Order>),
 }
 
 #[derive(Clone)]
 pub struct MatchingEngine {
     order_book: Arc<OrderBook>,
     risk_manager: Arc<RiskManager>,
+    metrics: Arc<EngineMetrics>,
+}
+
+pub struct EngineMetrics {
+    orders_processed: std::sync::atomic::AtomicU64,
+    trades_executed: std::sync::atomic::AtomicU64,
+    last_processing_time: std::sync::Mutex<Option<std::time::Duration>>,
+}
+
+impl EngineMetrics {
+    fn new() -> Self {
+        Self {
+            orders_processed: std::sync::atomic::AtomicU64::new(0),
+            trades_executed: std::sync::atomic::AtomicU64::new(0),
+            last_processing_time: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn inc_orders_processed(&self) {
+        self.orders_processed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn inc_trades_executed(&self, count: u64) {
+        self.trades_executed
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn set_processing_time(&self, duration: std::time::Duration) {
+        let mut guard = self.last_processing_time.lock().unwrap();
+        *guard = Some(duration);
+    }
+
+    fn report(&self) {
+        let orders = self
+            .orders_processed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let trades = self
+            .trades_executed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let time = self.last_processing_time.lock().unwrap();
+
+        let last_order_time = match *time {
+            Some(duration) => format!("{:?}", duration),
+            None => "N/A".to_string(),
+        };
+
+        info!(
+            "Engine metrics | Orders: {} | Trades: {} | Last order processing time: {}",
+            orders, trades, last_order_time
+        );
+    }
 }
 
 impl MatchingEngine {
     pub fn report_positions(&self) {
-        let get_price = |symbol: &str| {
-            self.order_book
-                .get_best_bid(symbol)
-                .zip(self.order_book.get_best_ask(symbol))
-                .map(|(bid, ask)| (bid + ask) / 2.0)
-        };
+        let get_price = |symbol: &str| self.order_book.get_mid_price(symbol);
 
         self.risk_manager.report_positions(get_price);
+        self.metrics.report();
     }
 
     pub fn new(
@@ -42,6 +103,7 @@ impl MatchingEngine {
             Self {
                 order_book,
                 risk_manager,
+                metrics: Arc::new(EngineMetrics::new()),
             },
             message_tx,
             message_rx,
@@ -51,9 +113,16 @@ impl MatchingEngine {
     pub async fn run(self, mut message_rx: mpsc::UnboundedReceiver<EngineMessage>) {
         while let Some(msg) = message_rx.recv().await {
             match msg {
-                EngineMessage::NewOrder(order) => self.process_order(order).await,
+                EngineMessage::NewOrder(order) => {
+                    self.process_order(order).await;
+                }
                 EngineMessage::CancelOrder { symbol, order_id } => {
-                    self.process_cancellation(&symbol, order_id).await
+                    self.process_cancellation(&symbol, order_id).await;
+                }
+                EngineMessage::BatchOrders(orders) => {
+                    for order in orders {
+                        self.process_order(order).await;
+                    }
                 }
             }
         }
@@ -68,185 +137,218 @@ impl MatchingEngine {
     }
 
     async fn process_order(&self, order: Order) {
-        let symbol = order.symbol.clone();
-        let mut remaining_qty = order.quantity;
+        let start_time = Instant::now();
+        self.metrics.inc_orders_processed();
 
+        let _symbol = order.symbol.clone();
         info!("Processing order {}: {:?}", order.id, order);
 
-        match order.order_type {
-            OrderType::Limit if order.price > 0.0 => {
-                let is_bid = matches!(order.side, OrderSide::Buy);
-                self.process_limit_order(&symbol, &order, &mut remaining_qty, is_bid)
-                    .await;
+        let trades = match order.order_type {
+            OrderType::Limit if order.price > 0.0 => self.match_limit_order(&order),
+            OrderType::Market => self.match_market_order(&order),
+            _ => {
+                warn!("Invalid order type/price");
+                Vec::new()
             }
-            OrderType::Market => {
-                let is_bid = matches!(order.side, OrderSide::Buy);
-                self.process_market_order(&symbol, &order, &mut remaining_qty, is_bid)
-                    .await;
-            }
-            _ => warn!("Invalid order type/price"),
+        };
+
+        // Record trades for risk management
+        for trade in &trades {
+            let trade_side = if trade.buyer_id == order.id {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            };
+
+            self.risk_manager.record_transaction(
+                &trade.symbol,
+                trade.price,
+                trade.quantity,
+                trade_side,
+            );
         }
 
-        if remaining_qty > 0.0 {
+        self.metrics.inc_trades_executed(trades.len() as u64);
+
+        // Add remaining order to order book if it's a limit order
+        let remaining_qty: f64 = order.quantity - trades.iter().map(|t| t.quantity).sum::<f64>();
+
+        if remaining_qty > 0.001 && order.order_type == OrderType::Limit {
             let mut new_order = order.clone();
             new_order.quantity = remaining_qty;
             self.order_book.add_order(new_order);
         }
-    }
 
-    async fn process_limit_order(
-        &self,
-        symbol: &str,
-        order: &Order,
-        remaining_qty: &mut f64,
-        is_bid: bool,
-    ) {
-        if is_bid {
-            self.match_orders(
-                symbol,
-                remaining_qty,
-                order.price,
-                |level_price, order_price| level_price <= order_price,
-                OrderSide::Buy,
-            )
-            .await;
-        } else {
-            self.match_orders(
-                symbol,
-                remaining_qty,
-                order.price,
-                |level_price, order_price| level_price >= order_price,
-                OrderSide::Sell,
-            )
-            .await;
+        let duration = start_time.elapsed();
+        self.metrics.set_processing_time(duration);
+
+        if !trades.is_empty() {
+            info!("Executed {} trades for order {}", trades.len(), order.id);
         }
     }
 
-    async fn process_market_order(
-        &self,
-        symbol: &str,
-        _order: &Order,
-        remaining_qty: &mut f64,
-        is_bid: bool,
-    ) {
-        if is_bid {
-            self.match_orders(
-                symbol,
-                remaining_qty,
-                0.0, // dummy value; price_check always returns true for market orders
-                |_, _| true,
-                OrderSide::Buy,
-            )
-            .await;
-        } else {
-            self.match_orders(symbol, remaining_qty, 0.0, |_, _| true, OrderSide::Sell)
-                .await;
+    fn match_limit_order(&self, order: &Order) -> Vec<Trade> {
+        match order.side {
+            OrderSide::Buy => self.match_buy_order(order, |ask_price| ask_price <= order.price),
+            OrderSide::Sell => self.match_sell_order(order, |bid_price| bid_price >= order.price),
         }
     }
 
-    async fn match_orders<F>(
-        &self,
-        symbol: &str,
-        remaining_qty: &mut f64,
-        order_price: f64,
-        price_check: F,
-        fill_side: OrderSide,
-    ) where
-        F: Fn(f64, f64) -> bool,
+    fn match_market_order(&self, order: &Order) -> Vec<Trade> {
+        match order.side {
+            OrderSide::Buy => self.match_buy_order(order, |_| true),
+            OrderSide::Sell => self.match_sell_order(order, |_| true),
+        }
+    }
+
+    fn match_buy_order<F>(&self, order: &Order, price_check: F) -> Vec<Trade>
+    where
+        F: Fn(f64) -> bool,
     {
-        if fill_side == OrderSide::Buy {
-            if let Some(mut asks) = self.order_book.asks.get_mut(symbol) {
-                let mut levels_to_remove = Vec::new();
-                // Iterate over ask levels (assumed sorted in ascending order)
-                for (price_key, orders) in asks.iter_mut() {
-                    let level_price = price_key.into_inner();
-                    if order_price > 0.0 && !price_check(level_price, order_price) {
-                        break;
+        let mut trades = Vec::new();
+        let mut remaining_qty = order.quantity;
+        let symbol = &order.symbol;
+
+        if let Some(mut asks) = self.order_book.asks.get_mut(symbol) {
+            let mut prices_to_check: Vec<OrderedFloat<f64>> = asks.keys().cloned().collect();
+            prices_to_check.sort();
+
+            for price_key in prices_to_check {
+                let price = price_key.into_inner();
+
+                if !price_check(price) {
+                    break;
+                }
+
+                if let Some(orders_at_price) = asks.get_mut(&price_key) {
+                    // Keep track of fully filled orders to remove
+                    let mut filled_indices = Vec::new();
+                    let mut _filled_qty = 0.0;
+
+                    for (idx, resting_order) in orders_at_price.iter_mut().enumerate() {
+                        if remaining_qty <= 0.0 {
+                            break;
+                        }
+
+                        let trade_qty = remaining_qty.min(resting_order.quantity);
+
+                        trades.push(Trade {
+                            id: chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64,
+                            symbol: symbol.clone(),
+                            price,
+                            quantity: trade_qty,
+                            buyer_id: order.id,
+                            seller_id: resting_order.id,
+                            timestamp: chrono::Utc::now().timestamp(),
+                        });
+
+                        remaining_qty -= trade_qty;
+                        resting_order.quantity -= trade_qty;
+                        _filled_qty += trade_qty;
+
+                        if resting_order.quantity <= 0.001 {
+                            filled_indices.push(idx);
+                            // Remove from index when fully filled
+                            self.order_book.order_index.remove(&resting_order.id);
+                        }
                     }
-                    // Pass a reference to fill_side instead of moving it.
-                    Self::fill_order_level(
-                        symbol,
-                        level_price,
-                        orders,
-                        remaining_qty,
-                        &fill_side,
-                        &self.risk_manager,
-                    );
-                    if orders.is_empty() {
-                        levels_to_remove.push(level_price);
+
+                    // Remove filled orders in reverse order to maintain correct indices
+                    for idx in filled_indices.iter().rev() {
+                        orders_at_price.remove(*idx);
                     }
-                    if *remaining_qty <= 0.0 {
-                        break;
+
+                    // If price level is empty, remove it
+                    if orders_at_price.is_empty() {
+                        asks.remove(&price_key);
                     }
                 }
-                for price in levels_to_remove {
-                    asks.remove(&OrderedFloat::from(price));
-                }
-            }
-        } else {
-            if let Some(mut bids) = self.order_book.bids.get_mut(symbol) {
-                let mut levels_to_remove = Vec::new();
-                // Iterate over bid levels (assumed sorted in descending order)
-                for (price_key, orders) in bids.iter_mut() {
-                    let level_price = price_key.0.into_inner();
-                    if order_price > 0.0 && !price_check(level_price, order_price) {
-                        break;
-                    }
-                    // Pass a reference to fill_side
-                    Self::fill_order_level(
-                        symbol,
-                        level_price,
-                        orders,
-                        remaining_qty,
-                        &fill_side,
-                        &self.risk_manager,
-                    );
-                    if orders.is_empty() {
-                        levels_to_remove.push(level_price);
-                    }
-                    if *remaining_qty <= 0.0 {
-                        break;
-                    }
-                }
-                for price in levels_to_remove {
-                    bids.remove(&Reverse(OrderedFloat::from(price)));
+
+                if remaining_qty <= 0.001 {
+                    break;
                 }
             }
         }
+
+        trades
     }
 
-    // The helper function now borrows fill_side.
-    fn fill_order_level(
-        symbol: &str,
-        level_price: f64,
-        orders: &mut Vec<Order>,
-        remaining_qty: &mut f64,
-        fill_side: &OrderSide,
-        risk_manager: &RiskManager,
-    ) {
-        let mut filled_indices = Vec::new();
-        for (idx, existing_order) in orders.iter_mut().enumerate() {
-            if *remaining_qty <= 0.0 {
-                break;
-            }
-            let fill_qty = (*remaining_qty).min(existing_order.quantity);
-            // Clone fill_side here because record_transaction requires ownership.
-            risk_manager.record_transaction(symbol, level_price, fill_qty, fill_side.clone());
-            *remaining_qty -= fill_qty;
-            existing_order.quantity -= fill_qty;
-            if existing_order.quantity <= 0.0 {
-                filled_indices.push(idx);
+    fn match_sell_order<F>(&self, order: &Order, price_check: F) -> Vec<Trade>
+    where
+        F: Fn(f64) -> bool,
+    {
+        let mut trades = Vec::new();
+        let mut remaining_qty = order.quantity;
+        let symbol = &order.symbol;
+
+        if let Some(mut bids) = self.order_book.bids.get_mut(symbol) {
+            let mut prices_to_check: Vec<Reverse<OrderedFloat<f64>>> =
+                bids.keys().cloned().collect();
+            prices_to_check.sort_by(|a, b| b.cmp(a)); // Reverse sort for highest bids first
+
+            for price_key in prices_to_check {
+                let price = price_key.0.into_inner();
+
+                if !price_check(price) {
+                    break;
+                }
+
+                if let Some(orders_at_price) = bids.get_mut(&price_key) {
+                    // Keep track of fully filled orders to remove
+                    let mut filled_indices = Vec::new();
+                    let mut _filled_qty = 0.0;
+
+                    for (idx, resting_order) in orders_at_price.iter_mut().enumerate() {
+                        if remaining_qty <= 0.0 {
+                            break;
+                        }
+
+                        let trade_qty = remaining_qty.min(resting_order.quantity);
+
+                        trades.push(Trade {
+                            id: chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64,
+                            symbol: symbol.clone(),
+                            price,
+                            quantity: trade_qty,
+                            buyer_id: resting_order.id,
+                            seller_id: order.id,
+                            timestamp: chrono::Utc::now().timestamp(),
+                        });
+
+                        remaining_qty -= trade_qty;
+                        resting_order.quantity -= trade_qty;
+                        _filled_qty += trade_qty;
+
+                        if resting_order.quantity <= 0.001 {
+                            filled_indices.push(idx);
+                            // Remove from index when fully filled
+                            self.order_book.order_index.remove(&resting_order.id);
+                        }
+                    }
+
+                    // Remove filled orders in reverse order to maintain correct indices
+                    for idx in filled_indices.iter().rev() {
+                        orders_at_price.remove(*idx);
+                    }
+
+                    // If price level is empty, remove it
+                    if orders_at_price.is_empty() {
+                        bids.remove(&price_key);
+                    }
+                }
+
+                if remaining_qty <= 0.001 {
+                    break;
+                }
             }
         }
-        // Remove fully filled orders in reverse order to avoid index shifting.
-        for idx in filled_indices.iter().rev() {
-            orders.remove(*idx);
-        }
+
+        trades
     }
 
     #[allow(dead_code)]
     pub async fn start_reporting(self: Arc<Self>, interval_secs: u64) {
-        let engine = Arc::new(self.clone());
+        let engine = Arc::clone(&self);
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));

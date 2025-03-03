@@ -385,6 +385,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "slab",
  "tokio",
  "uuid",
 ]
