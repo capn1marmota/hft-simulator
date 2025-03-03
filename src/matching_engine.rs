@@ -3,6 +3,8 @@ use crate::order_book::{Order, OrderBook, OrderType, OrderSide};
 use std::sync::Arc;
 use log::{warn, info};
 use crate::RiskManager;
+use ordered_float::OrderedFloat;
+use std::cmp::Reverse;
 
 pub enum EngineMessage {
     NewOrder(Order),
@@ -55,19 +57,18 @@ impl MatchingEngine {
 
     async fn process_order(&self, order: Order) {
         let symbol = order.symbol.clone();
-        let remaining_qty = order.quantity;
-        let order = order.clone();
+        let mut remaining_qty = order.quantity;
 
         info!("Processing order {}: {:?}", order.id, order);
-    
+
         match order.order_type {
             OrderType::Limit if order.price > 0.0 => {
                 let is_bid = matches!(order.side, OrderSide::Buy);
-                self.process_limit_order(&symbol, &order, remaining_qty, is_bid).await
+                self.process_limit_order(&symbol, &order, &mut remaining_qty, is_bid).await;
             }
             OrderType::Market => {
                 let is_bid = matches!(order.side, OrderSide::Buy);
-                self.process_market_order(&symbol, &order, remaining_qty, is_bid).await
+                self.process_market_order(&symbol, &order, &mut remaining_qty, is_bid).await;
             }
             _ => warn!("Invalid order type/price"),
         }
@@ -83,207 +84,142 @@ impl MatchingEngine {
         &self,
         symbol: &str,
         order: &Order,
-        mut remaining_qty: f64,
+        remaining_qty: &mut f64,
         is_bid: bool,
     ) {
         if is_bid {
-            self.match_bid_order(symbol, order, &mut remaining_qty).await
+            self.match_orders(
+                symbol,
+                remaining_qty,
+                order.price,
+                |level_price, order_price| level_price <= order_price,
+                OrderSide::Buy,
+            ).await;
         } else {
-            self.match_ask_order(symbol, order, &mut remaining_qty).await
-        }
-
-        if remaining_qty > 0.0 {
-            let mut new_order = order.clone();
-            new_order.quantity = remaining_qty;
-            self.order_book.add_order(new_order);
-        }
-    }
-
-    async fn match_bid_order(&self, symbol: &str, order: &Order, remaining_qty: &mut f64) {
-        if let Some(mut asks) = self.order_book.asks.get_mut(symbol) {
-            let mut to_remove = Vec::new();
-            
-            for (price_key, orders) in asks.iter_mut() {
-                let ask_price = price_key.into_inner();
-                if ask_price > order.price {
-                    break;
-                }
-
-                let mut filled_indices = Vec::new();
-                for (idx, ask_order) in orders.iter_mut().enumerate() {
-                    let fill_qty = (*remaining_qty).min(ask_order.quantity);
-                    self.record_transaction(symbol, ask_price, fill_qty, OrderSide::Buy);
-                    
-                    *remaining_qty -= fill_qty;
-                    ask_order.quantity -= fill_qty;
-
-                    if ask_order.quantity <= 0.0 {
-                        filled_indices.push(idx);
-                    }
-                    if *remaining_qty <= 0.0 {
-                        break;
-                    }
-                }
-
-                self.cleanup_filled_orders(orders, &filled_indices);
-                if orders.is_empty() {
-                    to_remove.push(*price_key);
-                }
-                if *remaining_qty <= 0.0 {
-                    break;
-                }
-            }
-
-            for price in to_remove {
-                asks.remove(&price);
-            }
-        }
-    }
-
-    async fn match_ask_order(&self, symbol: &str, order: &Order, remaining_qty: &mut f64) {
-        if let Some(mut bids) = self.order_book.bids.get_mut(symbol) {
-            let mut to_remove = Vec::new();
-            
-            for (price_key, orders) in bids.iter_mut() {
-                let bid_price = price_key.0.into_inner();
-                if bid_price < order.price {
-                    break;
-                }
-
-                let mut filled_indices = Vec::new();
-                for (idx, bid_order) in orders.iter_mut().enumerate() {
-                    let fill_qty = (*remaining_qty).min(bid_order.quantity);
-                    self.record_transaction(symbol, bid_price, fill_qty, OrderSide::Sell);
-                    
-                    *remaining_qty -= fill_qty;
-                    bid_order.quantity -= fill_qty;
-
-                    if bid_order.quantity <= 0.0 {
-                        filled_indices.push(idx);
-                    }
-                    if *remaining_qty <= 0.0 {
-                        break;
-                    }
-                }
-
-                self.cleanup_filled_orders(orders, &filled_indices);
-                if orders.is_empty() {
-                    to_remove.push(*price_key);
-                }
-                if *remaining_qty <= 0.0 {
-                    break;
-                }
-            }
-
-            for price in to_remove {
-                bids.remove(&price);
-            }
+            self.match_orders(
+                symbol,
+                remaining_qty,
+                order.price,
+                |level_price, order_price| level_price >= order_price,
+                OrderSide::Sell,
+            ).await;
         }
     }
 
     async fn process_market_order(
         &self,
         symbol: &str,
-        order: &Order,
-        mut remaining_qty: f64,
+        _order: &Order,
+        remaining_qty: &mut f64,
         is_bid: bool,
     ) {
         if is_bid {
-            self.process_market_buy(symbol, order, &mut remaining_qty).await
+            self.match_orders(
+                symbol,
+                remaining_qty,
+                0.0, // dummy value; price_check always returns true for market orders
+                |_, _| true,
+                OrderSide::Buy,
+            ).await;
         } else {
-            self.process_market_sell(symbol, order, &mut remaining_qty).await
+            self.match_orders(
+                symbol,
+                remaining_qty,
+                0.0,
+                |_, _| true,
+                OrderSide::Sell,
+            ).await;
         }
     }
 
-    async fn process_market_buy(&self, symbol: &str, _order: &Order, remaining_qty: &mut f64) {
-        if let Some(mut asks) = self.order_book.asks.get_mut(symbol) {
-            let mut to_remove = Vec::new();
-            
-            for (price_key, orders) in asks.iter_mut() {
-                let ask_price = price_key.into_inner();
-                let mut filled_indices = Vec::new();
-
-                for (idx, ask_order) in orders.iter_mut().enumerate() {
-                    let fill_qty = (*remaining_qty).min(ask_order.quantity);
-                    self.record_transaction(symbol, ask_price, fill_qty, OrderSide::Buy);
-                    
-                    *remaining_qty -= fill_qty;
-                    ask_order.quantity -= fill_qty;
-
-                    if ask_order.quantity <= 0.0 {
-                        filled_indices.push(idx);
+    async fn match_orders<F>(
+        &self,
+        symbol: &str,
+        remaining_qty: &mut f64,
+        order_price: f64,
+        price_check: F,
+        fill_side: OrderSide,
+    )
+    where
+        F: Fn(f64, f64) -> bool,
+    {
+        if fill_side == OrderSide::Buy {
+            if let Some(mut asks) = self.order_book.asks.get_mut(symbol) {
+                let mut levels_to_remove = Vec::new();
+                // Iterate over ask levels (assumed sorted in ascending order)
+                for (price_key, orders) in asks.iter_mut() {
+                    let level_price = price_key.into_inner();
+                    if order_price > 0.0 && !price_check(level_price, order_price) {
+                        break;
+                    }
+                    // Pass a reference to fill_side instead of moving it.
+                    Self::fill_order_level(symbol, level_price, orders, remaining_qty, &fill_side, &self.risk_manager);
+                    if orders.is_empty() {
+                        levels_to_remove.push(level_price);
                     }
                     if *remaining_qty <= 0.0 {
                         break;
                     }
                 }
-
-                self.cleanup_filled_orders(orders, &filled_indices);
-                if orders.is_empty() {
-                    to_remove.push(*price_key);
-                }
-                if *remaining_qty <= 0.0 {
-                    break;
+                for price in levels_to_remove {
+                    asks.remove(&OrderedFloat::from(price));
                 }
             }
-
-            for price in to_remove {
-                asks.remove(&price);
-            }
-        }
-    }
-
-    async fn process_market_sell(&self, symbol: &str, _order: &Order, remaining_qty: &mut f64) {
-        if let Some(mut bids) = self.order_book.bids.get_mut(symbol) {
-            let mut to_remove = Vec::new();
-            
-            for (price_key, orders) in bids.iter_mut() {
-                let bid_price = price_key.0.into_inner();
-                let mut filled_indices = Vec::new();
-
-                for (idx, bid_order) in orders.iter_mut().enumerate() {
-                    let fill_qty = (*remaining_qty).min(bid_order.quantity);
-                    self.record_transaction(symbol, bid_price, fill_qty, OrderSide::Sell);
-                    
-                    *remaining_qty -= fill_qty;
-                    bid_order.quantity -= fill_qty;
-
-                    if bid_order.quantity <= 0.0 {
-                        filled_indices.push(idx);
+        } else {
+            if let Some(mut bids) = self.order_book.bids.get_mut(symbol) {
+                let mut levels_to_remove = Vec::new();
+                // Iterate over bid levels (assumed sorted in descending order)
+                for (price_key, orders) in bids.iter_mut() {
+                    let level_price = price_key.0.into_inner();
+                    if order_price > 0.0 && !price_check(level_price, order_price) {
+                        break;
+                    }
+                    // Pass a reference to fill_side
+                    Self::fill_order_level(symbol, level_price, orders, remaining_qty, &fill_side, &self.risk_manager);
+                    if orders.is_empty() {
+                        levels_to_remove.push(level_price);
                     }
                     if *remaining_qty <= 0.0 {
                         break;
                     }
                 }
-
-                self.cleanup_filled_orders(orders, &filled_indices);
-                if orders.is_empty() {
-                    to_remove.push(*price_key);
+                for price in levels_to_remove {
+                    bids.remove(&Reverse(OrderedFloat::from(price)));
                 }
-                if *remaining_qty <= 0.0 {
-                    break;
-                }
-            }
-
-            for price in to_remove {
-                bids.remove(&price);
             }
         }
     }
 
-    fn cleanup_filled_orders(&self, orders: &mut Vec<Order>, filled_indices: &[usize]) {
+    // The helper function now borrows fill_side.
+    fn fill_order_level(
+        symbol: &str,
+        level_price: f64,
+        orders: &mut Vec<Order>,
+        remaining_qty: &mut f64,
+        fill_side: &OrderSide,
+        risk_manager: &RiskManager,
+    ) {
+        let mut filled_indices = Vec::new();
+        for (idx, existing_order) in orders.iter_mut().enumerate() {
+            if *remaining_qty <= 0.0 {
+                break;
+            }
+            let fill_qty = (*remaining_qty).min(existing_order.quantity);
+            // Clone fill_side here because record_transaction requires ownership.
+            risk_manager.record_transaction(symbol, level_price, fill_qty, fill_side.clone());
+            *remaining_qty -= fill_qty;
+            existing_order.quantity -= fill_qty;
+            if existing_order.quantity <= 0.0 {
+                filled_indices.push(idx);
+            }
+        }
+        // Remove fully filled orders in reverse order to avoid index shifting.
         for idx in filled_indices.iter().rev() {
             orders.remove(*idx);
         }
     }
 
-    fn record_transaction(&self, symbol: &str, price: f64, quantity: f64, side: OrderSide) {
-        if quantity > 0.0 {
-            self.risk_manager.record_transaction(symbol, price, quantity, side);
-        }
-    }
-
-    #[allow(dead_code)]  // Used for scheduled reporting
+    #[allow(dead_code)]
     pub async fn start_reporting(self: Arc<Self>, interval_secs: u64) {
         let engine = Arc::new(self.clone());
         tokio::spawn(async move {
@@ -294,5 +230,4 @@ impl MatchingEngine {
             }
         });
     }
-
 }

@@ -36,7 +36,6 @@ pub struct OrderBook {
     pub asks: DashMap<String, BTreeMap<OrderedFloat<f64>, Vec<Order>>>,          // Asks: lowest price first
 }
 
-
 impl OrderBook {
     pub fn new() -> Self {
         OrderBook {
@@ -44,6 +43,7 @@ impl OrderBook {
             asks: DashMap::new(),
         }
     }
+    
     pub fn add_order(&self, order: Order) {
         // Only limit orders can be added to the book
         if order.order_type != OrderType::Limit {
@@ -75,6 +75,7 @@ impl OrderBook {
     pub fn get_best_bid(&self, symbol: &str) -> Option<f64> {
         self.bids.get(symbol)
             .and_then(|bids_ref| {
+                // The last key in a BTreeMap of bids (using Reverse keys) is the highest bid
                 bids_ref.last_key_value().map(|(price, _)| price.0.into_inner())
             })
     }
@@ -82,6 +83,7 @@ impl OrderBook {
     pub fn get_best_ask(&self, symbol: &str) -> Option<f64> {
         self.asks.get(symbol)
             .and_then(|asks_ref| {
+                // The first key in a BTreeMap of asks is the lowest ask
                 asks_ref.first_key_value().map(|(price, _)| price.into_inner())
             })
     }
