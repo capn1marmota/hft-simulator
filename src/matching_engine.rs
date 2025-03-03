@@ -1,10 +1,10 @@
-use tokio::sync::mpsc;
-use crate::order_book::{Order, OrderBook, OrderType, OrderSide};
-use std::sync::Arc;
-use log::{warn, info};
+use crate::order_book::{Order, OrderBook, OrderSide, OrderType};
 use crate::RiskManager;
+use log::{info, warn};
 use ordered_float::OrderedFloat;
 use std::cmp::Reverse;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 pub enum EngineMessage {
     NewOrder(Order),
@@ -20,7 +20,8 @@ pub struct MatchingEngine {
 impl MatchingEngine {
     pub fn report_positions(&self) {
         let get_price = |symbol: &str| {
-            self.order_book.get_best_bid(symbol)
+            self.order_book
+                .get_best_bid(symbol)
                 .zip(self.order_book.get_best_ask(symbol))
                 .map(|(bid, ask)| (bid + ask) / 2.0)
         };
@@ -30,10 +31,21 @@ impl MatchingEngine {
 
     pub fn new(
         order_book: Arc<OrderBook>,
-        risk_manager: Arc<RiskManager>
-    ) -> (Self, mpsc::UnboundedSender<EngineMessage>, mpsc::UnboundedReceiver<EngineMessage>) {
+        risk_manager: Arc<RiskManager>,
+    ) -> (
+        Self,
+        mpsc::UnboundedSender<EngineMessage>,
+        mpsc::UnboundedReceiver<EngineMessage>,
+    ) {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
-        (Self { order_book, risk_manager }, message_tx, message_rx)
+        (
+            Self {
+                order_book,
+                risk_manager,
+            },
+            message_tx,
+            message_rx,
+        )
     }
 
     pub async fn run(self, mut message_rx: mpsc::UnboundedReceiver<EngineMessage>) {
@@ -47,8 +59,8 @@ impl MatchingEngine {
         }
     }
 
-    async fn process_cancellation(&self, symbol: &str, order_id: u64) {
-        if self.order_book.cancel_order(symbol, order_id) {
+    async fn process_cancellation(&self, _symbol: &str, order_id: u64) {
+        if self.order_book.cancel_order(order_id) {
             info!("Cancelled order {}", order_id);
         } else {
             warn!("Failed to cancel order {}", order_id);
@@ -64,11 +76,13 @@ impl MatchingEngine {
         match order.order_type {
             OrderType::Limit if order.price > 0.0 => {
                 let is_bid = matches!(order.side, OrderSide::Buy);
-                self.process_limit_order(&symbol, &order, &mut remaining_qty, is_bid).await;
+                self.process_limit_order(&symbol, &order, &mut remaining_qty, is_bid)
+                    .await;
             }
             OrderType::Market => {
                 let is_bid = matches!(order.side, OrderSide::Buy);
-                self.process_market_order(&symbol, &order, &mut remaining_qty, is_bid).await;
+                self.process_market_order(&symbol, &order, &mut remaining_qty, is_bid)
+                    .await;
             }
             _ => warn!("Invalid order type/price"),
         }
@@ -94,7 +108,8 @@ impl MatchingEngine {
                 order.price,
                 |level_price, order_price| level_price <= order_price,
                 OrderSide::Buy,
-            ).await;
+            )
+            .await;
         } else {
             self.match_orders(
                 symbol,
@@ -102,7 +117,8 @@ impl MatchingEngine {
                 order.price,
                 |level_price, order_price| level_price >= order_price,
                 OrderSide::Sell,
-            ).await;
+            )
+            .await;
         }
     }
 
@@ -120,15 +136,11 @@ impl MatchingEngine {
                 0.0, // dummy value; price_check always returns true for market orders
                 |_, _| true,
                 OrderSide::Buy,
-            ).await;
+            )
+            .await;
         } else {
-            self.match_orders(
-                symbol,
-                remaining_qty,
-                0.0,
-                |_, _| true,
-                OrderSide::Sell,
-            ).await;
+            self.match_orders(symbol, remaining_qty, 0.0, |_, _| true, OrderSide::Sell)
+                .await;
         }
     }
 
@@ -139,8 +151,7 @@ impl MatchingEngine {
         order_price: f64,
         price_check: F,
         fill_side: OrderSide,
-    )
-    where
+    ) where
         F: Fn(f64, f64) -> bool,
     {
         if fill_side == OrderSide::Buy {
@@ -153,7 +164,14 @@ impl MatchingEngine {
                         break;
                     }
                     // Pass a reference to fill_side instead of moving it.
-                    Self::fill_order_level(symbol, level_price, orders, remaining_qty, &fill_side, &self.risk_manager);
+                    Self::fill_order_level(
+                        symbol,
+                        level_price,
+                        orders,
+                        remaining_qty,
+                        &fill_side,
+                        &self.risk_manager,
+                    );
                     if orders.is_empty() {
                         levels_to_remove.push(level_price);
                     }
@@ -175,7 +193,14 @@ impl MatchingEngine {
                         break;
                     }
                     // Pass a reference to fill_side
-                    Self::fill_order_level(symbol, level_price, orders, remaining_qty, &fill_side, &self.risk_manager);
+                    Self::fill_order_level(
+                        symbol,
+                        level_price,
+                        orders,
+                        remaining_qty,
+                        &fill_side,
+                        &self.risk_manager,
+                    );
                     if orders.is_empty() {
                         levels_to_remove.push(level_price);
                     }
@@ -223,7 +248,8 @@ impl MatchingEngine {
     pub async fn start_reporting(self: Arc<Self>, interval_secs: u64) {
         let engine = Arc::new(self.clone());
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
             loop {
                 interval.tick().await;
                 engine.report_positions();
