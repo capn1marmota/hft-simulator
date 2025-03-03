@@ -1,41 +1,41 @@
 mod market_data;
-mod order_book;
 mod matching_engine;
+mod order_book;
 mod risk_management;
+use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::Decimal;
 
-use std::sync::Arc;
-use std::time::Duration;
-use uuid::Uuid;
-use tokio::signal;
-use rand::Rng;
 use crate::market_data::fetch_market_data;
 use crate::{
-    order_book::{Order, OrderBook, OrderType, OrderSide},
-    matching_engine::{MatchingEngine, EngineMessage},
+    matching_engine::{EngineMessage, MatchingEngine},
+    order_book::{Order, OrderBook, OrderSide, OrderType},
     risk_management::RiskManager,
 };
+use rand::Rng;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::signal;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() {
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)
         .init();
-    
+
     // Initialize core components
     let order_book = Arc::new(OrderBook::new());
-    
+
     // Create the risk manager first
     let risk_manager = Arc::new({
-        let rm = RiskManager::new(1_000_000.0);
-        rm.set_position_limit("AAPL", 10_000.0);
+        let rm = RiskManager::new(Decimal::from(1_000_000));
+        rm.set_position_limit("AAPL", Decimal::from(10_000));
         rm
     });
-    
+
     // Then create the matching engine
-    let (matching_engine, engine_tx, message_rx) = MatchingEngine::new(
-        order_book.clone(), 
-        risk_manager.clone()
-    );
+    let (matching_engine, engine_tx, message_rx) =
+        MatchingEngine::new(order_book.clone(), risk_manager.clone());
     let matching_engine = Arc::new(matching_engine);
 
     // Start market data stream
@@ -48,10 +48,12 @@ async fn main() {
                 interval.tick().await;
                 if let Ok(data) = fetch_market_data("AAPL").await {
                     log::info!("Received {} market data points", data.len());
-                    for (_, md) in data {
-                        let orders = md.to_orders("AAPL");
+                    for (_, md) in data.iter() {
+                        let orders = md.to_orders("AAPL", Decimal::new(1, 2));
                         for order in orders {
-                            engine_tx_clone.send(EngineMessage::NewOrder(order)).unwrap();
+                            engine_tx_clone
+                                .send(EngineMessage::NewOrder(order))
+                                .unwrap();
                         }
                     }
                 }
@@ -80,14 +82,14 @@ async fn main() {
                 interval.tick().await;
                 if let (Some(bid), Some(ask)) = (
                     order_book.get_best_bid("AAPL"),
-                    order_book.get_best_ask("AAPL")
+                    order_book.get_best_ask("AAPL"),
                 ) {
                     log::info!("Spread: {:.2} - {:.2} ({:.2})", bid, ask, ask - bid);
                 }
             }
         }
     });
-    
+
     // Update market data in order book
     tokio::spawn({
         let order_book = order_book.clone();
@@ -98,7 +100,7 @@ async fn main() {
                 if let Ok(data) = fetch_market_data("AAPL").await {
                     log::info!("Processing {} market data entries", data.len());
                     for (_ts, md) in data {
-                        order_book.update_from_market_data("AAPL", &md);
+                        order_book.update_from_market_data("AAPL", &md, Decimal::new(1, 2));
                     }
                 }
             }
@@ -123,9 +125,8 @@ async fn main() {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                risk_manager_clone.report_positions(|symbol| {
-                    order_book_clone.get_mid_price(symbol)
-                });
+                risk_manager_clone
+                    .report_positions(|symbol| order_book_clone.get_mid_price(symbol));
             }
         });
     }
@@ -139,21 +140,30 @@ async fn main() {
     // Order generation loop
     let order_loop = async {
         let mut rng = rand::thread_rng();
-        
+
         loop {
+            let price = Decimal::from_f64(150.0 + rng.gen::<f64>() * 5.0).unwrap_or(Decimal::ZERO);
+            let quantity = Decimal::from(100);
+
             let order = Order {
                 id: Uuid::new_v4().as_u128() as u64,
                 symbol: "AAPL".to_string(),
-                price: 150.0 + rng.gen::<f64>() * 5.0,
-                quantity: 100.0,
+                price,
+                quantity,
                 order_type: OrderType::Limit,
-                side: if rng.gen() { OrderSide::Buy } else { OrderSide::Sell },
+                side: if rng.gen() {
+                    OrderSide::Buy
+                } else {
+                    OrderSide::Sell
+                },
                 timestamp: chrono::Utc::now().timestamp(),
             };
 
             if risk_manager.validate_order(&order) {
-                engine_tx.send(EngineMessage::NewOrder(order.clone())).unwrap();
-                
+                engine_tx
+                    .send(EngineMessage::NewOrder(order.clone()))
+                    .unwrap();
+
                 // 25% chance to cancel after 1 second
                 if rand::random::<f64>() < 0.25 {
                     let tx = engine_tx.clone();
@@ -161,7 +171,8 @@ async fn main() {
                     let order_id = order.id;
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_secs(1)).await;
-                        tx.send(EngineMessage::CancelOrder { symbol, order_id }).unwrap();
+                        tx.send(EngineMessage::CancelOrder { symbol, order_id })
+                            .unwrap();
                     });
                 }
             }

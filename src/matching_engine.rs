@@ -1,23 +1,25 @@
 use crate::order_book::{Order, OrderBook, OrderSide, OrderType};
 use crate::risk_management::RiskManager;
 use log::{info, warn};
-use ordered_float::OrderedFloat;
+use rust_decimal::Decimal;
 use std::cmp::Reverse;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Trade {
     pub id: u64,
     pub symbol: String,
-    pub price: f64,
-    pub quantity: f64,
+    pub price: Decimal,
+    pub quantity: Decimal,
     pub buyer_id: u64,
     pub seller_id: u64,
     pub timestamp: i64,
 }
 
+#[allow(dead_code)]
 pub enum EngineMessage {
     NewOrder(Order),
     CancelOrder { symbol: String, order_id: u64 },
@@ -85,7 +87,6 @@ impl EngineMetrics {
 impl MatchingEngine {
     pub fn report_positions(&self) {
         let get_price = |symbol: &str| self.order_book.get_mid_price(symbol);
-
         self.risk_manager.report_positions(get_price);
         self.metrics.report();
     }
@@ -128,14 +129,6 @@ impl MatchingEngine {
         }
     }
 
-    async fn process_cancellation(&self, _symbol: &str, order_id: u64) {
-        if self.order_book.cancel_order(order_id) {
-            info!("Cancelled order {}", order_id);
-        } else {
-            warn!("Failed to cancel order {}", order_id);
-        }
-    }
-
     async fn process_order(&self, order: Order) {
         let start_time = Instant::now();
         self.metrics.inc_orders_processed();
@@ -144,7 +137,7 @@ impl MatchingEngine {
         info!("Processing order {}: {:?}", order.id, order);
 
         let trades = match order.order_type {
-            OrderType::Limit if order.price > 0.0 => self.match_limit_order(&order),
+            OrderType::Limit if order.price > Decimal::ZERO => self.match_limit_order(&order),
             OrderType::Market => self.match_market_order(&order),
             _ => {
                 warn!("Invalid order type/price");
@@ -171,9 +164,9 @@ impl MatchingEngine {
         self.metrics.inc_trades_executed(trades.len() as u64);
 
         // Add remaining order to order book if it's a limit order
-        let remaining_qty: f64 = order.quantity - trades.iter().map(|t| t.quantity).sum::<f64>();
+        let remaining_qty = order.quantity - trades.iter().map(|t| t.quantity).sum::<Decimal>();
 
-        if remaining_qty > 0.001 && order.order_type == OrderType::Limit {
+        if remaining_qty > Decimal::new(1, 3) && order.order_type == OrderType::Limit {
             let mut new_order = order.clone();
             new_order.quantity = remaining_qty;
             self.order_book.add_order(new_order);
@@ -184,6 +177,14 @@ impl MatchingEngine {
 
         if !trades.is_empty() {
             info!("Executed {} trades for order {}", trades.len(), order.id);
+        }
+    }
+
+    async fn process_cancellation(&self, _symbol: &str, order_id: u64) {
+        if self.order_book.cancel_order(order_id) {
+            log::info!("Cancelled order {}", order_id);
+        } else {
+            log::warn!("Failed to cancel order {}", order_id);
         }
     }
 
@@ -203,30 +204,27 @@ impl MatchingEngine {
 
     fn match_buy_order<F>(&self, order: &Order, price_check: F) -> Vec<Trade>
     where
-        F: Fn(f64) -> bool,
+        F: Fn(Decimal) -> bool,
     {
         let mut trades = Vec::new();
         let mut remaining_qty = order.quantity;
         let symbol = &order.symbol;
 
         if let Some(mut asks) = self.order_book.asks.get_mut(symbol) {
-            let mut prices_to_check: Vec<OrderedFloat<f64>> = asks.keys().cloned().collect();
+            let mut prices_to_check: Vec<Decimal> = asks.keys().cloned().collect();
             prices_to_check.sort();
 
-            for price_key in prices_to_check {
-                let price = price_key.into_inner();
-
+            for price in prices_to_check {
                 if !price_check(price) {
                     break;
                 }
 
-                if let Some(orders_at_price) = asks.get_mut(&price_key) {
-                    // Keep track of fully filled orders to remove
+                if let Some(orders_at_price) = asks.get_mut(&price) {
                     let mut filled_indices = Vec::new();
-                    let mut _filled_qty = 0.0;
+                    let mut _filled_qty = Decimal::ZERO;
 
                     for (idx, resting_order) in orders_at_price.iter_mut().enumerate() {
-                        if remaining_qty <= 0.0 {
+                        if remaining_qty <= Decimal::ZERO {
                             break;
                         }
 
@@ -246,25 +244,22 @@ impl MatchingEngine {
                         resting_order.quantity -= trade_qty;
                         _filled_qty += trade_qty;
 
-                        if resting_order.quantity <= 0.001 {
+                        if resting_order.quantity <= Decimal::new(1, 3) {
                             filled_indices.push(idx);
-                            // Remove from index when fully filled
                             self.order_book.order_index.remove(&resting_order.id);
                         }
                     }
 
-                    // Remove filled orders in reverse order to maintain correct indices
                     for idx in filled_indices.iter().rev() {
                         orders_at_price.remove(*idx);
                     }
 
-                    // If price level is empty, remove it
                     if orders_at_price.is_empty() {
-                        asks.remove(&price_key);
+                        asks.remove(&price);
                     }
                 }
 
-                if remaining_qty <= 0.001 {
+                if remaining_qty <= Decimal::new(1, 3) {
                     break;
                 }
             }
@@ -275,31 +270,28 @@ impl MatchingEngine {
 
     fn match_sell_order<F>(&self, order: &Order, price_check: F) -> Vec<Trade>
     where
-        F: Fn(f64) -> bool,
+        F: Fn(Decimal) -> bool,
     {
         let mut trades = Vec::new();
         let mut remaining_qty = order.quantity;
         let symbol = &order.symbol;
 
         if let Some(mut bids) = self.order_book.bids.get_mut(symbol) {
-            let mut prices_to_check: Vec<Reverse<OrderedFloat<f64>>> =
-                bids.keys().cloned().collect();
-            prices_to_check.sort_by(|a, b| b.cmp(a)); // Reverse sort for highest bids first
+            let mut prices_to_check: Vec<Decimal> = bids.keys().map(|k| k.0).collect();
+            prices_to_check.sort_by(|a, b| b.cmp(a));
 
-            for price_key in prices_to_check {
-                let price = price_key.0.into_inner();
-
+            for price in prices_to_check {
                 if !price_check(price) {
                     break;
                 }
 
+                let price_key = Reverse(price);
                 if let Some(orders_at_price) = bids.get_mut(&price_key) {
-                    // Keep track of fully filled orders to remove
                     let mut filled_indices = Vec::new();
-                    let mut _filled_qty = 0.0;
+                    let mut _filled_qty = Decimal::ZERO;
 
                     for (idx, resting_order) in orders_at_price.iter_mut().enumerate() {
-                        if remaining_qty <= 0.0 {
+                        if remaining_qty <= Decimal::ZERO {
                             break;
                         }
 
@@ -319,25 +311,22 @@ impl MatchingEngine {
                         resting_order.quantity -= trade_qty;
                         _filled_qty += trade_qty;
 
-                        if resting_order.quantity <= 0.001 {
+                        if resting_order.quantity <= Decimal::new(1, 3) {
                             filled_indices.push(idx);
-                            // Remove from index when fully filled
                             self.order_book.order_index.remove(&resting_order.id);
                         }
                     }
 
-                    // Remove filled orders in reverse order to maintain correct indices
                     for idx in filled_indices.iter().rev() {
                         orders_at_price.remove(*idx);
                     }
 
-                    // If price level is empty, remove it
                     if orders_at_price.is_empty() {
                         bids.remove(&price_key);
                     }
                 }
 
-                if remaining_qty <= 0.001 {
+                if remaining_qty <= Decimal::new(1, 3) {
                     break;
                 }
             }
