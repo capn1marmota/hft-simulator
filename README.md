@@ -28,6 +28,12 @@ A high-frequency trading simulator written in Rust that models a complete tradin
 2. Set your Alpha Vantage API key:
    ```
    export ALPHA_VANTAGE_API_KEY="your_api_key_here"
+
+      ## Setup
+
+   1. Copy `.env.example` to `.env`
+   2. Replace the placeholder API key with your actual Alpha Vantage API key
+   3. Do not commit your `.env` file
    ```
 
 3. Build the project:
@@ -36,6 +42,8 @@ A high-frequency trading simulator written in Rust that models a complete tradin
    ```
 
 ### Running the Simulator
+
+
 
 ```
 cargo run

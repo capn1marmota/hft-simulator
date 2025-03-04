@@ -153,6 +153,7 @@ impl OrderBook {
         }
     }
 
+    #[allow(dead_code)]
     pub fn update_from_market_data(&self, symbol: &str, data: &MinuteData, tick_size: Decimal) {
         let orders = data.to_orders(symbol, tick_size);
         for order in orders {
