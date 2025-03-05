@@ -343,7 +343,34 @@ impl MatchingEngine {
                 tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
             loop {
                 interval.tick().await;
+                // Existing position reporting
                 engine.report_positions();
+
+                // Additional detailed metrics
+                let order_book = engine.order_book.clone();
+                let (bid_depth, ask_depth) = order_book.get_order_book_depth("AAPL");
+                log::info!("Detailed Trading Metrics:");
+                log::info!(
+                    "Order Book Depth - Bids: {}, Asks: {}",
+                    bid_depth,
+                    ask_depth
+                );
+                log::info!(
+                    "Total Order Operations: {}",
+                    order_book.get_operation_count()
+                );
+
+                // Potential risk analysis
+                let risk_analysis = engine.risk_manager.analyze_portfolio_risk();
+                for (symbol, metrics) in risk_analysis {
+                    log::info!(
+                        "Risk Analysis for {}: Position: {}, Realized PnL: {}, Limit Utilization: {}%",
+                        symbol,
+                        metrics.current_position(),
+                        metrics.realized_pnl(),
+                        metrics.utilization()
+                    );
+                }
             }
         });
     }

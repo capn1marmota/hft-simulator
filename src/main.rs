@@ -3,21 +3,23 @@ mod matching_engine;
 mod order_book;
 mod risk_management;
 
-use crate::market_data::fetch_market_data;
 use crate::{
+    market_data::{fetch_market_data, EfficientMarketDataBuffer, MarketDataManager},
     matching_engine::{EngineMessage, MatchingEngine},
     order_book::{Order, OrderBook, OrderSide, OrderType},
     risk_management::RiskManager,
 };
 use rand::Rng;
 use reqwest::Client;
-use rust_decimal::prelude::FromPrimitive;
-use rust_decimal::Decimal;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::signal;
-use tokio::sync::Mutex;
+use rust_decimal::{prelude::FromPrimitive, Decimal};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::{signal, sync::Mutex};
 
 // Define a static atomic counter for unique order IDs
 static ORDER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -44,6 +46,9 @@ async fn main() {
         rm.set_position_limit("AAPL", Decimal::from(10_000));
         rm
     });
+
+    // Initialize Efficient Market Data Buffer
+    let market_data_buffer = Arc::new(EfficientMarketDataBuffer::new(100));
 
     // Initialize matching engine
     let (matching_engine, engine_tx, message_rx) =
@@ -117,6 +122,43 @@ async fn main() {
             }
         }
     });
+
+    // Market Data Manager task: Periodically update market data
+    let mut market_data_manager = MarketDataManager::new(&["AAPL".to_string()]);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Err(e) = market_data_manager.update_data().await {
+                log::error!("Market data update error: {:?}", e);
+            }
+        }
+    });
+
+    // Market Data Buffer Analysis Task: Periodically analyze buffered data
+    tokio::spawn({
+        let market_data_buffer = market_data_buffer.clone();
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let recent_data = market_data_buffer.get_recent_data();
+
+                if !recent_data.is_empty() {
+                    // Simple analysis: calculate average close price
+                    let avg_close: Decimal = recent_data
+                        .iter()
+                        .map(|(_, data)| data.close)
+                        .sum::<Decimal>()
+                        / Decimal::from(recent_data.len());
+
+                    log::info!("Recent data average close price: {:.2}", avg_close);
+                }
+            }
+        }
+    });
+
+    matching_engine.start_reporting(10).await;
 
     // Shutdown listener
     let shutdown = async {

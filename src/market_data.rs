@@ -3,8 +3,50 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer};
-use std::{collections::HashMap, str::FromStr, time::Duration};
+use std::sync::Mutex;
+use std::{
+    collections::{HashMap, VecDeque},
+    str::FromStr,
+    time::Duration,
+};
 
+#[allow(dead_code)]
+pub struct EfficientMarketDataBuffer {
+    // Use Mutex for thread-safe access with lower overhead
+    buffer: Mutex<VecDeque<(DateTime<Utc>, MinuteData)>>,
+    capacity: usize,
+}
+
+impl EfficientMarketDataBuffer {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            buffer: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn add_data(&self, data: Vec<(DateTime<Utc>, MinuteData)>) {
+        let mut buffer = self.buffer.lock().unwrap();
+
+        // Efficient buffer management
+        for item in data {
+            if buffer.len() >= self.capacity {
+                buffer.pop_front();
+            }
+            buffer.push_back(item);
+        }
+    }
+
+    pub fn get_recent_data(&self) -> Vec<(DateTime<Utc>, MinuteData)> {
+        self.buffer.lock().unwrap().iter().cloned().collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn clear(&self) {
+        self.buffer.lock().unwrap().clear();
+    }
+}
 /// Custom error type for market data fetching.
 #[derive(Debug)]
 pub enum MarketDataError {
@@ -158,7 +200,7 @@ pub struct MarketDataManager {
     cache: HashMap<String, Vec<(DateTime<Utc>, MinuteData)>>,
     last_update: HashMap<String, DateTime<Utc>>,
 }
-#[allow(dead_code)]
+
 impl MarketDataManager {
     pub fn new(symbols: &[String]) -> Self {
         MarketDataManager {
@@ -169,7 +211,6 @@ impl MarketDataManager {
     }
 
     /// Updates market data for all tracked symbols concurrently.
-    #[allow(dead_code)]
     pub async fn update_data(&mut self) -> Result<(), MarketDataError> {
         let symbols: Vec<String> = self.cache.keys().cloned().collect();
         let mut tasks = Vec::new();
@@ -207,6 +248,7 @@ impl MarketDataManager {
         self.cache.get(symbol).map(|v| v.as_slice())
     }
 
+    #[allow(dead_code)]
     pub fn last_update(&self, symbol: &str) -> Option<DateTime<Utc>> {
         self.last_update.get(symbol).copied()
     }

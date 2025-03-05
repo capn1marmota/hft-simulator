@@ -1,9 +1,11 @@
 use crate::market_data::MinuteData;
 use dashmap::DashMap;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::cmp::Reverse;
-use std::collections::btree_map::Entry as BTreeEntry;
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
@@ -18,6 +20,50 @@ pub enum OrderSide {
     Sell,
 }
 
+#[allow(dead_code)]
+struct AtomicOrderQueue {
+    orders: Mutex<VecDeque<Order>>,
+    total_quantity: AtomicU64,
+}
+#[allow(dead_code)]
+impl AtomicOrderQueue {
+    fn new() -> Self {
+        Self {
+            orders: Mutex::new(VecDeque::new()),
+            total_quantity: AtomicU64::new(0),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn add_order(&self, order: Order) {
+        let quantity_u64 = order.quantity.to_u64().unwrap_or(0);
+
+        // Atomic quantity update
+        self.total_quantity
+            .fetch_add(quantity_u64, Ordering::Relaxed);
+
+        // Thread-safe order insertion
+        let mut orders = self.orders.lock().unwrap();
+        orders.push_back(order);
+    }
+
+    #[allow(dead_code)]
+    fn remove_order(&self, order_id: u64) -> Option<Order> {
+        let mut orders = self.orders.lock().unwrap();
+        if let Some(idx) = orders.iter().position(|o| o.id == order_id) {
+            let order = orders.remove(idx).unwrap();
+
+            // Atomic quantity reduction
+            let quantity_u64 = order.quantity.to_u64().unwrap_or(0);
+            self.total_quantity
+                .fetch_sub(quantity_u64, Ordering::Relaxed);
+
+            Some(order)
+        } else {
+            None
+        }
+    }
+}
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Order {
@@ -34,18 +80,38 @@ pub struct OrderBook {
     pub bids: DashMap<String, BTreeMap<Reverse<Decimal>, Vec<Order>>>,
     pub asks: DashMap<String, BTreeMap<Decimal, Vec<Order>>>,
     pub order_index: DashMap<u64, (String, Decimal, OrderSide)>,
+
+    // Performance tracking
+    order_operations: AtomicUsize,
 }
 
+#[allow(dead_code)]
 impl OrderBook {
     pub fn new() -> Self {
         OrderBook {
             bids: DashMap::new(),
             asks: DashMap::new(),
             order_index: DashMap::new(),
+            order_operations: AtomicUsize::new(0),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn load_historical_market_data(
+        &self,
+        historical_data: &[MinuteData],
+        symbol: &str,
+        tick_size: Decimal,
+    ) {
+        for data in historical_data {
+            self.update_from_market_data(symbol, data, tick_size);
         }
     }
 
     pub fn add_order(&self, order: Order) {
+        // Increment operation counter
+        self.order_operations.fetch_add(1, Ordering::Relaxed);
+
         if order.order_type != OrderType::Limit {
             log::warn!(
                 "Unsupported order type for OrderBook: {:?}",
@@ -64,6 +130,7 @@ impl OrderBook {
             return;
         }
 
+        // Store order index
         self.order_index.insert(
             order.id,
             (order.symbol.clone(), order.price, order.side.clone()),
@@ -90,13 +157,15 @@ impl OrderBook {
     }
 
     pub fn cancel_order(&self, order_id: u64) -> bool {
+        // Increment operation counter
+        self.order_operations.fetch_add(1, Ordering::Relaxed);
+
         if let Some((_, (sym, price, side))) = self.order_index.remove(&order_id) {
             match side {
                 OrderSide::Buy => {
                     if let Some(mut bids) = self.bids.get_mut(&sym) {
                         let price_key = Reverse(price);
-                        if let BTreeEntry::Occupied(mut price_entry) = bids.entry(price_key) {
-                            // Isolate the mutable borrow in a nested scope
+                        if let Entry::Occupied(mut price_entry) = bids.entry(price_key) {
                             let (modified, is_empty) = {
                                 let orders = price_entry.get_mut();
                                 let len_before = orders.len();
@@ -114,7 +183,7 @@ impl OrderBook {
                 OrderSide::Sell => {
                     if let Some(mut asks) = self.asks.get_mut(&sym) {
                         let price_key = price;
-                        if let BTreeEntry::Occupied(mut price_entry) = asks.entry(price_key) {
+                        if let Entry::Occupied(mut price_entry) = asks.entry(price_key) {
                             let (modified, is_empty) = {
                                 let orders = price_entry.get_mut();
                                 let len_before = orders.len();
@@ -134,6 +203,7 @@ impl OrderBook {
         false
     }
 
+    // Existing methods from original implementation
     pub fn get_best_bid(&self, symbol: &str) -> Option<Decimal> {
         self.bids
             .get(symbol)
@@ -151,6 +221,27 @@ impl OrderBook {
             (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::from(2)),
             _ => None,
         }
+    }
+
+    pub fn get_order_book_depth(&self, symbol: &str) -> (usize, usize) {
+        let bid_depth = self
+            .bids
+            .get(symbol)
+            .map(|bids| bids.values().map(|orders| orders.len()).sum())
+            .unwrap_or(0);
+
+        let ask_depth = self
+            .asks
+            .get(symbol)
+            .map(|asks| asks.values().map(|orders| orders.len()).sum())
+            .unwrap_or(0);
+
+        (bid_depth, ask_depth)
+    }
+
+    // New performance monitoring method
+    pub fn get_operation_count(&self) -> usize {
+        self.order_operations.load(Ordering::Relaxed)
     }
 
     #[allow(dead_code)]
